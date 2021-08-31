@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/diamondburned/arikawa/v3/api"
 	"github.com/diamondburned/arikawa/v3/bot"
@@ -18,6 +19,36 @@ type Bot struct {
 	Ctx *bot.Context
 
 	OwnerID discord.UserID
+}
+
+func (bot *Bot) getMembers(gid discord.GuildID) ([]discord.Member, error) {
+	out, cancel := bot.Ctx.ChanFor(
+		func(ev interface{}) bool {
+			_, ok := ev.(*gateway.GuildMembersChunkEvent)
+			return ok
+		})
+	defer cancel()
+	err := bot.Ctx.Gateway.RequestGuildMembers(gateway.RequestGuildMembersData{
+		GuildIDs: []discord.GuildID{gid},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gateway request: %w", err)
+	}
+	var members []discord.Member
+	timer := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-out:
+			e := ev.(*gateway.GuildMembersChunkEvent)
+			members = append(members, e.Members...)
+			fmt.Println(e.ChunkCount, e.ChunkIndex)
+			if e.ChunkCount == e.ChunkIndex+1 {
+				return members, nil
+			}
+		case <-timer:
+			return members, errors.New("discord took too long to respond")
+		}
+	}
 }
 
 func (b *Bot) Addrole(m *gateway.MessageCreateEvent, from, to string) error {
@@ -51,11 +82,14 @@ func (b *Bot) Addrole(m *gateway.MessageCreateEvent, from, to string) error {
 	if !rfrom.IsValid() {
 		return fmt.Errorf("role '%s' not found", rfrom)
 	}
-	members, err := b.Ctx.Members(m.GuildID)
+	members, err := b.getMembers(m.GuildID)
 	if err != nil {
-		return fmt.Errorf("fetching membors: %v", members)
+		return fmt.Errorf("fetching members: %v", err)
 	}
+
+	b.Ctx.SendTextReply(m.ChannelID, fmt.Sprint("fetched ", len(members), " members in total"), m.ID)
 	errs := new(strings.Builder)
+	addedcount := 0
 Outer:
 	for _, mem := range members {
 		if mem.User.ID == b.Ctx.Ready().User.ID {
@@ -73,16 +107,18 @@ Outer:
 		if !hasfrom {
 			continue
 		}
-		roles := append(mem.RoleIDs, rto)
-		if err := b.Ctx.ModifyMember(m.GuildID, mem.User.ID,
-			api.ModifyMemberData{Roles: &roles}); err != nil {
+		if err := b.Ctx.AddRole(m.GuildID, mem.User.ID, rto); err != nil {
 			fmt.Fprintf(errs, "modifying member roles for %s: %v\n", mem.User.Username, err)
+		} else {
+			fmt.Printf("added role to member #%d\n", addedcount)
+			addedcount++
 		}
 	}
-	if errs.Len() == 0 {
-		return nil
+	if errs.Len() != 0 {
+		return errors.New(errs.String())
 	}
-	return errors.New(errs.String())
+	_, err = b.Ctx.SendTextReply(m.ChannelID, fmt.Sprintf("added role to %d members", addedcount), m.ID)
+	return err
 }
 
 func (b *Bot) Moveserver(m *gateway.MessageCreateEvent, from, to discord.GuildID) error {
@@ -159,7 +195,7 @@ func (b *Bot) Moveserver(m *gateway.MessageCreateEvent, from, to discord.GuildID
 		}
 		chanids[c.ID] = newchan.ID
 	}
-	return nil
+	return err
 }
 
 func main() {
@@ -170,7 +206,10 @@ func main() {
 	b := new(Bot)
 	b.OwnerID = discord.UserID(*uid)
 	bot.Run(*token, b, func(c *bot.Context) error {
+		c.AddIntents(gateway.IntentGuildMembers)
+		fmt.Println("intents added")
 		c.HasPrefix = bot.NewPrefix(*prefix)
+
 		c.SilentUnknown = struct{ Command, Subcommand bool }{true, true}
 		return nil
 	})
